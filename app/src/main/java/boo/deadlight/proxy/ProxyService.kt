@@ -125,13 +125,13 @@ class ProxyService : Service() {
     }
     private fun writeDefaultConfig(): File {
         val conf = File(filesDir, "deadlight.conf")
-        if (!conf.exists()) {
+        if (!conf.exists() || conf.readText().contains("worker_threads = 2")) {
             conf.writeText("""
                 [core]
                 port = 8080
-                max_connections = 100
-                worker_threads = 2
-                log_level = 2
+                max_connections = 500
+                worker_threads = 8
+                log_level = info
 
                 [security]
                 auth_secret =
@@ -184,8 +184,10 @@ class ProxyService : Service() {
     }
 
     private fun stopProxy() {
-        proxyProcess?.destroy()
-        proxyProcess?.waitFor(2000, java.util.concurrent.TimeUnit.MILLISECONDS) // graceful shutdown
+        proxyProcess?.destroy()  // sends SIGTERM, not SIGKILL on Android
+        if (proxyProcess?.waitFor(2000, TimeUnit.MILLISECONDS) == false) {
+            proxyProcess?.destroyForcibly()  // SIGKILL only if it didn't exit cleanly
+        }
         proxyProcess = null
     }
 

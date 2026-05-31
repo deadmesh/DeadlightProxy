@@ -8,4 +8,14 @@
 /captures
 .externalNativeBuild
 .cxx
+
+# Android signing
+*.jks
+*.keystore
+
+# Release artifacts
 app/release/
+
+# Native/debug
+obj/
+libs/
