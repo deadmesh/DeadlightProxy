@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
@@ -18,24 +19,31 @@ class ProxyService : Service() {
     private val TAG = "DeadlightProxy"
     private val NOTIFICATION_ID = 1
     private val CHANNEL_ID = "deadlight_proxy_channel"
+    private var intentionalStop = false
 
     companion object {
         const val ACTION_STOP = "boo.deadlight.proxy.STOP"
+        const val ACTION_RELOAD_CONFIG = "boo.deadlight.proxy.RELOAD_CONFIG"
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopProxy()
-            stopSelf()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> {
+                stopProxy()
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            ACTION_RELOAD_CONFIG -> {
+                reloadConfig()
+                return START_STICKY
+            }
+            else -> {
+                createNotificationChannel()
+                startForegroundWithType("Starting Deadlight Proxy...", isRunning = true)
+                Thread(::startProxy).start()
+                return START_STICKY
+            }
         }
-
-        createNotificationChannel()
-        startForegroundWithType("Starting Deadlight Proxy...", isRunning = true)
-
-        Thread(::startProxy).start()
-
-        return START_STICKY
     }
 
     private fun startForegroundWithType(status: String, isRunning: Boolean) {
@@ -51,19 +59,21 @@ class ProxyService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
     }
+
     private fun startProxy() {
         try {
             val libDir = applicationInfo.nativeLibraryDir
             val binary = File(libDir, "libdeadlight.so")
 
             if (!binary.exists()) {
-                Log.e(TAG, "Binary not found")
+                Log.e(TAG, "Binary not found at $libDir")
                 updateNotification("Error: Binary not found", isRunning = false)
                 return
             }
 
             binary.setExecutable(true)
-            val configFile = writeDefaultConfig()
+            val configFile = ensureConfigExists()
+            val port = readPortFromConfig(configFile)
 
             proxyProcess = ProcessBuilder(
                 binary.absolutePath,
@@ -77,13 +87,95 @@ class ProxyService : Service() {
                 redirectOutput(File(filesDir, "proxy.log"))
             }.start()
 
-            updateNotification("Running • 127.0.0.1:8080", isRunning = true)
+            updateNotification("Running • 127.0.0.1:$port", isRunning = true)
+            Log.i(TAG, "Proxy started with config: ${configFile.absolutePath}")
+
             pipeLogsToLogcat()
             monitorProcess()
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start proxy", e)
             updateNotification("Failed to start", isRunning = false)
+        }
+    }
+
+    private fun ensureConfigExists(): File {
+        val conf = File(filesDir, "deadlight.conf")
+
+        // Only write defaults on first launch
+        if (!conf.exists()) {
+            writeDefaultConfig(conf)
+        }
+
+        return conf
+    }
+
+    private fun writeDefaultConfig(conf: File) {
+        try {
+            val prefs = getSharedPreferences(SettingsActivity.PREFS_NAME, Context.MODE_PRIVATE)
+            val port = prefs.getInt(SettingsActivity.KEY_PORT, SettingsActivity.DEFAULT_PORT)
+            val threads = prefs.getInt(SettingsActivity.KEY_THREADS, SettingsActivity.DEFAULT_THREADS)
+            val maxConn = prefs.getInt(SettingsActivity.KEY_MAX_CONN, SettingsActivity.DEFAULT_MAX_CONN)
+            val logLevel = prefs.getString(SettingsActivity.KEY_LOG_LEVEL, SettingsActivity.DEFAULT_LOG_LEVEL)
+
+            conf.writeText("""
+                [core]
+                port = $port
+                max_connections = $maxConn
+                worker_threads = $threads
+                log_level = $logLevel
+
+                [security]
+                auth_secret =
+
+                [ssl]
+                enabled = false
+                ca_cert_file = ${filesDir.absolutePath}/.deadlight/ca.crt
+                ca_key_file = ${filesDir.absolutePath}/.deadlight/ca.key
+
+                [vpn]
+                enabled = false
+
+                [plugins]
+                enabled = false
+
+                [blog]
+                enable_cache = false
+            """.trimIndent())
+
+            Log.i(TAG, "Default config written to ${conf.absolutePath}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to write default config", e)
+        }
+    }
+
+    private fun readPortFromConfig(file: File): Int {
+        return try {
+            file.readLines()
+                .find { it.trim().startsWith("port =") }
+                ?.substringAfter("=")
+                ?.trim()
+                ?.toIntOrNull() ?: SettingsActivity.DEFAULT_PORT
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to read port from config", e)
+            SettingsActivity.DEFAULT_PORT
+        }
+    }
+
+    private fun reloadConfig() {
+        proxyProcess?.let { process ->
+            try {
+                // Send SIGHUP via kill command
+                val pidField = process.javaClass.getDeclaredField("pid")
+                pidField.isAccessible = true
+                val pid = pidField.getInt(process)
+
+                Runtime.getRuntime().exec(arrayOf("kill", "-HUP", pid.toString()))
+                Log.i(TAG, "Sent SIGHUP to proxy PID $pid")
+                updateNotification("Config reloaded", isRunning = true)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to send SIGHUP", e)
+            }
         }
     }
 
@@ -123,36 +215,6 @@ class ProxyService : Service() {
             .setOngoing(true)
             .build()
     }
-    private fun writeDefaultConfig(): File {
-        val conf = File(filesDir, "deadlight.conf")
-        if (!conf.exists() || conf.readText().contains("worker_threads = 2")) {
-            conf.writeText("""
-                [core]
-                port = 8080
-                max_connections = 500
-                worker_threads = 8
-                log_level = info
-
-                [security]
-                auth_secret =
-
-                [ssl]
-                enabled = false
-                ca_cert_file = ${filesDir.absolutePath}/.deadlight/ca.crt
-                ca_key_file = ${filesDir.absolutePath}/.deadlight/ca.key
-
-                [vpn]
-                enabled = false
-
-                [plugins]
-                enabled = false
-
-                [blog]
-                enable_cache = false
-            """.trimIndent())
-        }
-        return conf
-    }
 
     private fun pipeLogsToLogcat() {
         Thread {
@@ -173,20 +235,23 @@ class ProxyService : Service() {
         Thread {
             try {
                 val exitCode = proxyProcess?.waitFor() ?: -1
-                if (exitCode != 0) {
-                    Log.w(TAG, "Proxy process exited with code: $exitCode")
-                    updateNotification("Proxy stopped unexpectedly", isRunning = false)
+                if (exitCode != 0 && !intentionalStop) {
+                    Log.e(TAG, "Proxy process exited with code: $exitCode")
+                    updateNotification("Proxy stopped unexpectedly (code: $exitCode)", isRunning = false)
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Process monitoring error", e)
+                if (!intentionalStop) {
+                    Log.e(TAG, "Process monitoring error", e)
+                }
             }
         }.apply { isDaemon = true; start() }
     }
 
     private fun stopProxy() {
-        proxyProcess?.destroy()  // sends SIGTERM, not SIGKILL on Android
+        intentionalStop = true
+        proxyProcess?.destroy()
         if (proxyProcess?.waitFor(2000, TimeUnit.MILLISECONDS) == false) {
-            proxyProcess?.destroyForcibly()  // SIGKILL only if it didn't exit cleanly
+            proxyProcess?.destroyForcibly()
         }
         proxyProcess = null
     }

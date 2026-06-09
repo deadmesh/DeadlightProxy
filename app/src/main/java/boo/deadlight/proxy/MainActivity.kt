@@ -17,6 +17,9 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import android.view.View
+import android.app.Activity
+import android.content.Context
+import androidx.activity.result.contract.ActivityResultContracts
 
 class MainActivity : AppCompatActivity() {
 
@@ -29,11 +32,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var uptimeText: TextView
     private lateinit var connectionsText: TextView
     private lateinit var bytesText: TextView
+    private var proxyPort: Int = SettingsActivity.DEFAULT_PORT
 
     private var logFilter = "ALL"
     private val allLogLines = ArrayDeque<String>(400)
     private var lastLogLine: String? = null
     private var filterButtons = mutableMapOf<String, Button>()
+    private var pendingProxyRestart = false
 
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var root: LinearLayout
@@ -47,13 +52,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var guillotineIcon: ImageView
     private var pulseAnimator: android.view.ViewPropertyAnimator? = null
 
-    // Proxy state enum for guillotine icon logic
     private enum class ProxyState { STOPPED, STARTING, RUNNING, STOPPING }
     private var proxyState = ProxyState.STOPPED
 
     companion object {
         private const val NOTIF_PERMISSION_CODE = 1001
-        private const val UI_PORT = 8080
         private const val MAX_LOG_LINES = 400
 
         private val COLOR_BG      = 0xFF080808.toInt()
@@ -72,13 +75,55 @@ class MainActivity : AppCompatActivity() {
         private const val PULSE_SCALE = 1.025f
     }
 
+    private val settingsLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val prefs = getSharedPreferences(SettingsActivity.PREFS_NAME, Context.MODE_PRIVATE)
+            val newPort = prefs.getInt(SettingsActivity.KEY_PORT, SettingsActivity.DEFAULT_PORT)
+            val viewMode = prefs.getString(SettingsActivity.KEY_VIEW_MODE, SettingsActivity.DEFAULT_VIEW_MODE)
+                ?: SettingsActivity.DEFAULT_VIEW_MODE
+
+            val portChanged = (newPort != proxyPort)
+            val viewModeChanged = (viewMode == SettingsActivity.VIEW_GUILLOTINE && !guillotineMode) ||
+                    (viewMode == SettingsActivity.VIEW_TERMINAL && guillotineMode)
+
+            proxyPort = newPort
+
+            // Switch view mode if needed
+            when {
+                viewMode == SettingsActivity.VIEW_GUILLOTINE && !guillotineMode -> enterGuillotineMode()
+                viewMode == SettingsActivity.VIEW_TERMINAL && guillotineMode -> exitGuillotineMode()
+            }
+
+            // If port changed, must stop proxy before recreating
+            if (portChanged && isRunning) {
+                sseRunning = false  // Stop SSE thread immediately
+                stopProxyFromUi()
+                pendingProxyRestart = true
+                // Wait for proxy to stop before recreating
+                handler.postDelayed({ recreate() }, QUICK_PRESS_TRANSITION_MS + 100)
+            } else if (viewModeChanged) {
+                // Just recreate for view mode change, proxy keeps running
+                handler.postDelayed({ recreate() }, 300)
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Load prefs FIRST before any UI or network setup
+        val prefs = getSharedPreferences(SettingsActivity.PREFS_NAME, Context.MODE_PRIVATE)
+        proxyPort = prefs.getInt(SettingsActivity.KEY_PORT, SettingsActivity.DEFAULT_PORT)
+        val savedViewMode = prefs.getString(SettingsActivity.KEY_VIEW_MODE, SettingsActivity.DEFAULT_VIEW_MODE)
+        guillotineMode = (savedViewMode == SettingsActivity.VIEW_GUILLOTINE)
+
         window.decorView.setBackgroundColor(COLOR_BG)
 
         root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(COLOR_BG)
+            setBackgroundColor(COLOR_BG)hould
             setPadding(40, 100, 40, 40)
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -87,14 +132,34 @@ class MainActivity : AppCompatActivity() {
         }
 
         // Title
-        root.addView(TextView(this).apply {
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 20 }
+        }
+        titleRow.addView(TextView(this).apply {
             text = "D E A D L I G H T  //  P R O X Y"
             textSize = 14f
             typeface = Typeface.MONOSPACE
             setTextColor(COLOR_TEXT)
             letterSpacing = 0.15f
-            setPadding(0, 0, 0, 20)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         })
+        titleRow.addView(TextView(this).apply {
+            text = "⚙"
+            textSize = 18f
+            setTextColor(COLOR_DIM)
+            setPadding(16, 0, 4, 0)
+            setOnClickListener {
+                settingsLauncher.launch(Intent(this@MainActivity, SettingsActivity::class.java))
+                @Suppress("DEPRECATION")
+                overridePendingTransition(0, 0)
+            }
+        })
+        root.addView(titleRow)
 
         statusText = TextView(this).apply {
             text = "● STOPPED"
@@ -106,7 +171,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(statusText)
 
         addressText = TextView(this).apply {
-            text = "Proxy: 127.0.0.1:8080"
+            text = "Proxy: 127.0.0.1:$proxyPort"
             textSize = 12f
             typeface = Typeface.MONOSPACE
             setTextColor(COLOR_DIM)
@@ -129,7 +194,6 @@ class MainActivity : AppCompatActivity() {
 
         restoreSavedUiState(savedInstanceState)
 
-        // Long-press on status dot to enter guillotine mode
         statusText.setOnLongClickListener {
             enterGuillotineMode()
             true
@@ -161,17 +225,18 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun restoreSavedUiState(savedInstanceState: Bundle?) {
-        guillotineMode = savedInstanceState
-            ?.getBoolean(KEY_GUILLOTINE_MODE, false)
-            ?: false
+        // Only override guillotineMode from savedInstanceState if it exists
+        // (rotation etc). On recreate() savedInstanceState is null so we
+        // keep whatever was loaded from prefs in onCreate.
+        if (savedInstanceState != null) {
+            guillotineMode = savedInstanceState.getBoolean(KEY_GUILLOTINE_MODE, guillotineMode)
+        }
 
         if (guillotineMode) {
             root.visibility = View.GONE
             root.alpha = 0f
-
             guillotineRoot.visibility = View.VISIBLE
             guillotineRoot.alpha = 1f
-
             guillotineIcon.animate().cancel()
             guillotineIcon.alpha = 1f
             guillotineIcon.scaleX = 1f
@@ -180,10 +245,8 @@ class MainActivity : AppCompatActivity() {
         } else {
             root.visibility = View.VISIBLE
             root.alpha = 1f
-
             guillotineRoot.visibility = View.GONE
             guillotineRoot.alpha = 1f
-
             stopIconPulse()
         }
     }
@@ -310,19 +373,19 @@ class MainActivity : AppCompatActivity() {
     private fun updateFilterButtons() {
         filterButtons.forEach { (filter, btn) ->
             btn.setTextColor(when {
-                filter == logFilter && filter == "WARN" -> Color.parseColor("#D4924A")
+                filter == logFilter && filter == "WARN"  -> Color.parseColor("#D4924A")
                 filter == logFilter && filter == "ERROR" -> COLOR_ERR
-                filter == logFilter -> COLOR_ACCENT
-                else -> COLOR_DIM
+                filter == logFilter                      -> COLOR_ACCENT
+                else                                     -> COLOR_DIM
             })
         }
     }
 
     private fun passesFilter(line: String): Boolean = when (logFilter) {
-        "INFO" -> !line.contains("[DEBUG]")
-        "WARN" -> line.contains("[WARN]") || line.contains("[ERROR]")
+        "INFO"  -> !line.contains("[DEBUG]")
+        "WARN"  -> line.contains("[WARN]") || line.contains("[ERROR]")
         "ERROR" -> line.contains("[ERROR]")
-        else -> true
+        else    -> true
     }
 
     private fun refreshLogDisplay() {
@@ -332,13 +395,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun doStartProxy() {
-        setProxyState(
-            nextState = ProxyState.STARTING,
-            transitionMs = QUICK_PRESS_TRANSITION_MS
-        )
-
+        setProxyState(ProxyState.STARTING, QUICK_PRESS_TRANSITION_MS)
         startForegroundService(Intent(this, ProxyService::class.java))
-
         handler.postDelayed({
             isRunning = true
             setRunningState()
@@ -368,9 +426,7 @@ class MainActivity : AppCompatActivity() {
 
         if (guillotineMode) {
             handler.postDelayed({
-                if (guillotineMode && proxyState == ProxyState.RUNNING) {
-                    startIconPulse()
-                }
+                if (guillotineMode && proxyState == ProxyState.RUNNING) startIconPulse()
             }, if (animated) SETTLE_TRANSITION_MS else 0L)
         }
     }
@@ -399,25 +455,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun stableStateForRestore(state: ProxyState): ProxyState {
-        return when (state) {
-            ProxyState.STARTING -> ProxyState.STOPPED
-            ProxyState.STOPPING -> ProxyState.STOPPED
-            ProxyState.RUNNING -> ProxyState.RUNNING
-            ProxyState.STOPPED -> ProxyState.STOPPED
-        }
-    }
-
     private fun stopProxyFromUi() {
-        setProxyState(
-            nextState = ProxyState.STOPPING,
-            transitionMs = QUICK_PRESS_TRANSITION_MS
-        )
-
+        setProxyState(ProxyState.STOPPING, QUICK_PRESS_TRANSITION_MS)
         stopService(Intent(this, ProxyService::class.java).apply {
             action = ProxyService.ACTION_STOP
         })
-
         handler.postDelayed({
             isRunning = false
             setStoppedState()
@@ -427,26 +469,20 @@ class MainActivity : AppCompatActivity() {
     private fun syncRunningState() {
         Thread {
             val running = isProxyActuallyRunning()
-
             handler.post {
-                if (running) {
-                    setRunningState(animated = false)
-                } else {
-                    setStoppedState(animated = false)
-                }
+                if (running) setRunningState(animated = false)
+                else setStoppedState(animated = false)
             }
         }.start()
     }
 
     private fun isProxyActuallyRunning(): Boolean {
         return try {
-            val conn = URL("http://127.0.0.1:$UI_PORT/api/metrics")
+            val conn = URL("http://127.0.0.1:$proxyPort/api/metrics")
                 .openConnection() as HttpURLConnection
-
             conn.connectTimeout = 500
             conn.readTimeout = 500
             conn.requestMethod = "GET"
-
             val ok = conn.responseCode in 200..299
             conn.disconnect()
             ok
@@ -456,8 +492,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun copyAddress() {
-        val clipboard = getSystemService(ClipboardManager::class.java)
-        clipboard.setPrimaryClip(ClipData.newPlainText("proxy", "127.0.0.1:8080"))
+        val clipboard = getSystemService(ClipboardManager::class.java) ?: return  // Add null check
+        clipboard.setPrimaryClip(ClipData.newPlainText("proxy", "127.0.0.1:$proxyPort"))
         Toast.makeText(this, "Copied to clipboard", Toast.LENGTH_SHORT).show()
     }
 
@@ -479,7 +515,6 @@ class MainActivity : AppCompatActivity() {
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_CENTER
             layoutParams = FrameLayout.LayoutParams(sizePx, sizePx, Gravity.CENTER)
-
             setOnClickListener { toggleProxy() }
             setOnLongClickListener {
                 exitGuillotineMode()
@@ -489,6 +524,8 @@ class MainActivity : AppCompatActivity() {
 
         return FrameLayout(this).apply {
             setBackgroundColor(COLOR_BG)
+            isClickable = false
+            isFocusable = false
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
@@ -501,14 +538,21 @@ class MainActivity : AppCompatActivity() {
     private fun startSseStream() {
         sseRunning = true
         sseThread = Thread {
+            var consecutiveFailures = 0
             while (sseRunning) {
                 try {
-                    val conn = URL("http://127.0.0.1:8080/api/stream")
+                    consecutiveFailures = 0
+                    val conn = URL("http://127.0.0.1:$proxyPort/api/stream")
                         .openConnection() as HttpURLConnection
                     conn.connectTimeout = 3000
                     conn.readTimeout = 60000
                     conn.setRequestProperty("Accept", "text/event-stream")
                     conn.setRequestProperty("Cache-Control", "no-cache")
+
+                    handler.post {
+                        uptimeText.setTextColor(COLOR_ACCENT)
+                        connectionsText.setTextColor(COLOR_OK)
+                    }
 
                     val reader = conn.inputStream.bufferedReader()
                     var eventType = ""
@@ -518,11 +562,9 @@ class MainActivity : AppCompatActivity() {
                         val l = reader.readLine() ?: break
                         when {
                             l.startsWith("event:") -> eventType = l.removePrefix("event:").trim()
-                            l.startsWith("data:") -> dataBuffer.append(l.removePrefix("data:").trim())
+                            l.startsWith("data:")  -> dataBuffer.append(l.removePrefix("data:").trim())
                             l.isEmpty() && dataBuffer.isNotEmpty() -> {
-                                if (eventType == "dashboard") {
-                                    handleDashboardEvent(dataBuffer.toString())
-                                }
+                                if (eventType == "dashboard") handleDashboardEvent(dataBuffer.toString())
                                 eventType = ""
                                 dataBuffer = StringBuilder()
                             }
@@ -530,12 +572,28 @@ class MainActivity : AppCompatActivity() {
                     }
                     conn.disconnect()
                 } catch (e: Exception) {
-                    android.util.Log.e("ProxySSE", "Stream error", e)
+                    consecutiveFailures++
+                    android.util.Log.e("ProxySSE", "Stream error (attempt $consecutiveFailures)", e)
+
+                    // Show user that stream is disconnected
+                    handler.post {
+                        uptimeText.setTextColor(COLOR_DIM)
+                        connectionsText.setTextColor(COLOR_DIM)
+                        bytesText.setTextColor(COLOR_DIM)
+                    }
+
+                    // Exponential backoff (3s, 6s, 12s, max 30s)
+                    if (consecutiveFailures < 10) {
+                        val delay = (3000L * (1 shl (consecutiveFailures - 1))).coerceAtMost(30000L)
+                        Thread.sleep(delay)
+                    } else {
+                        Thread.sleep(30000L)
+                    }
                 }
-                if (sseRunning) Thread.sleep(3000)
             }
         }.apply { isDaemon = true; start() }
     }
+
     private fun handleDashboardEvent(data: String) {
         try {
             val json = JSONObject(data)
@@ -544,7 +602,7 @@ class MainActivity : AppCompatActivity() {
 
             val uptime = metrics.optLong("uptime", 0)
             val active = metrics.optInt("active_connections", 0)
-            val bytes = metrics.optLong("bytes_transferred", 0)
+            val bytes  = metrics.optLong("bytes_transferred", 0)
 
             handler.post {
                 uptimeText.text = formatUptime(uptime)
@@ -591,48 +649,43 @@ class MainActivity : AppCompatActivity() {
         return when {
             h > 0 -> "${h}h ${m}m"
             m > 0 -> "${m}m"
-            else -> "${seconds}s"
+            else  -> "${seconds}s"
         }
     }
 
     private fun formatBytes(bytes: Long): String = when {
         bytes >= 1_073_741_824 -> "%.1f GB".format(bytes / 1_073_741_824.0)
-        bytes >= 1_048_576 -> "%.1f MB".format(bytes / 1_048_576.0)
-        bytes >= 1_024 -> "%.1f KB".format(bytes / 1_024.0)
-        else -> "$bytes B"
+        bytes >= 1_048_576     -> "%.1f MB".format(bytes / 1_048_576.0)
+        bytes >= 1_024         -> "%.1f KB".format(bytes / 1_024.0)
+        else                   -> "$bytes B"
     }
 
     override fun onRequestPermissionsResult(
         requestCode: Int, permissions: Array<out String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == NOTIF_PERMISSION_CODE && pendingStart && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+        if (requestCode == NOTIF_PERMISSION_CODE && pendingStart &&
+            grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+        ) {
             pendingStart = false
             doStartProxy()
         }
     }
 
-    private fun setProxyState(
-        nextState: ProxyState,
-        transitionMs: Long = 450L
-    ) {
+    private fun setProxyState(nextState: ProxyState, transitionMs: Long = 450L) {
         proxyState = nextState
 
         when (nextState) {
             ProxyState.RUNNING -> {
                 transitionGuillotineIconTo(nextState, transitionMs)
                 handler.postDelayed({
-                    if (guillotineMode && proxyState == ProxyState.RUNNING) {
-                        startIconPulse()
-                    }
+                    if (guillotineMode && proxyState == ProxyState.RUNNING) startIconPulse()
                 }, transitionMs)
             }
-
             ProxyState.STOPPED -> {
                 stopIconPulse()
                 transitionGuillotineIconTo(nextState, transitionMs)
             }
-
             ProxyState.STARTING,
             ProxyState.STOPPING -> {
                 stopIconPulse()
@@ -642,39 +695,41 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun iconForState(state: ProxyState): Int = when (state) {
-        ProxyState.STOPPED          -> R.drawable.icon_error      // green outline, transparent bg
-        ProxyState.STARTING         -> R.drawable.icon_stopped
-        ProxyState.STOPPING         -> R.drawable.ic_notification_stopped
-        ProxyState.RUNNING          -> R.drawable.icon_running      // green/pink filled
+        ProxyState.STOPPED  -> R.drawable.icon_error
+        ProxyState.STARTING -> R.drawable.icon_stopped
+        ProxyState.STOPPING -> R.drawable.ic_notification_stopped
+        ProxyState.RUNNING  -> R.drawable.icon_running
     }
 
     private fun startIconPulse() {
         stopIconPulse()
-
         if (!guillotineMode || proxyState != ProxyState.RUNNING) return
+        if (!::guillotineIcon.isInitialized) return
 
         fun pulse() {
+            // Check conditions again before starting
             if (!guillotineMode || proxyState != ProxyState.RUNNING) return
-
-            pulseAnimator = guillotineIcon.animate()
-                .scaleX(PULSE_SCALE)
-                .scaleY(PULSE_SCALE)
-                .setDuration(PULSE_DURATION_MS)
-                .withEndAction {
-                    if (!guillotineMode || proxyState != ProxyState.RUNNING) return@withEndAction
-
-                    pulseAnimator = guillotineIcon.animate()
-                        .scaleX(1f)
-                        .scaleY(1f)
-                        .setDuration(PULSE_DURATION_MS)
-                        .withEndAction {
-                            if (guillotineMode && proxyState == ProxyState.RUNNING) pulse()
-                        }
-
-                    pulseAnimator?.start()
-                }
-
-            pulseAnimator?.start()
+            if (!isDestroyed) {  // Safety check
+                pulseAnimator = guillotineIcon.animate()
+                    .scaleX(PULSE_SCALE)
+                    .scaleY(PULSE_SCALE)
+                    .setDuration(PULSE_DURATION_MS)
+                    .withEndAction {
+                        // Double-check before continuing
+                        if (isDestroyed || !guillotineMode || proxyState != ProxyState.RUNNING) return@withEndAction
+                        pulseAnimator = guillotineIcon.animate()
+                            .scaleX(1f)
+                            .scaleY(1f)
+                            .setDuration(PULSE_DURATION_MS)
+                            .withEndAction {
+                                if (!isDestroyed && guillotineMode && proxyState == ProxyState.RUNNING) {
+                                    pulse()
+                                }
+                            }
+                        pulseAnimator?.start()
+                    }
+                pulseAnimator?.start()
+            }
         }
 
         pulse()
@@ -682,7 +737,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun stopIconPulse() {
         pulseAnimator = null
-
         if (::guillotineIcon.isInitialized) {
             guillotineIcon.animate().cancel()
             guillotineIcon.scaleX = 1f
@@ -693,6 +747,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun enterGuillotineMode() {
         guillotineMode = true
+        guillotineRoot.isClickable = true
+        guillotineRoot.isFocusable = true
 
         guillotineIcon.animate().cancel()
         guillotineRoot.animate().cancel()
@@ -703,7 +759,6 @@ class MainActivity : AppCompatActivity() {
         guillotineIcon.scaleX = 0.94f
         guillotineIcon.scaleY = 0.94f
         guillotineIcon.setImageResource(iconForState(proxyState))
-
         guillotineRoot.visibility = View.VISIBLE
 
         root.animate()
@@ -711,20 +766,11 @@ class MainActivity : AppCompatActivity() {
             .setDuration(300)
             .withEndAction {
                 root.visibility = View.GONE
-
-                guillotineRoot.animate()
-                    .alpha(1f)
-                    .setDuration(300)
-                    .start()
-
+                guillotineRoot.animate().alpha(1f).setDuration(300).start()
                 guillotineIcon.animate()
-                    .alpha(1f)
-                    .scaleX(1f)
-                    .scaleY(1f)
+                    .alpha(1f).scaleX(1f).scaleY(1f)
                     .setDuration(450)
-                    .withEndAction {
-                        if (proxyState == ProxyState.RUNNING) startIconPulse()
-                    }
+                    .withEndAction { if (proxyState == ProxyState.RUNNING) startIconPulse() }
                     .start()
             }
             .start()
@@ -732,6 +778,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun exitGuillotineMode() {
         guillotineMode = false
+        guillotineRoot.isClickable = false
+        guillotineRoot.isFocusable = false
         stopIconPulse()
 
         guillotineRoot.animate().alpha(0f).setDuration(350).withEndAction {
@@ -744,28 +792,20 @@ class MainActivity : AppCompatActivity() {
 
     private fun transitionGuillotineIconTo(state: ProxyState, duration: Long = 450L) {
         if (!::guillotineIcon.isInitialized) return
-
         val next = iconForState(state)
-
         handler.post {
             guillotineIcon.animate().cancel()
-
             if (!guillotineMode) {
                 guillotineIcon.setImageResource(next)
                 guillotineIcon.alpha = 1f
                 return@post
             }
-
             guillotineIcon.animate()
                 .alpha(0f)
                 .setDuration(duration / 2)
                 .withEndAction {
                     guillotineIcon.setImageResource(next)
-
-                    guillotineIcon.animate()
-                        .alpha(1f)
-                        .setDuration(duration / 2)
-                        .start()
+                    guillotineIcon.animate().alpha(1f).setDuration(duration / 2).start()
                 }
                 .start()
         }
@@ -774,6 +814,14 @@ class MainActivity : AppCompatActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         outState.putBoolean(KEY_GUILLOTINE_MODE, guillotineMode)
         super.onSaveInstanceState(outState)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (pendingProxyRestart) {
+            pendingProxyRestart = false
+            handler.postDelayed({ doStartProxy() }, 600)
+        }
     }
 
     override fun onDestroy() {
